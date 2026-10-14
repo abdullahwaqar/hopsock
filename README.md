@@ -1,7 +1,5 @@
 # hopsock
 
-**Chrome can't log in to a SOCKS5 proxy. hopsock fixes that.**
-
 Chromium browsers (Chrome, Vivaldi, Brave, Edge) don't support username and
 password auth for SOCKS5 proxies, and they leak DNS and WebRTC traffic around
 a proxy unless you pass the right flags. hopsock runs a local, auth-free SOCKS5
