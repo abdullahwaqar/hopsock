@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -39,6 +41,7 @@ var (
 type keyMap struct {
 	Quit, Retest, Launch, Focus, Clear, Debug, Follow, Up, Down key.Binding
 	Pick, Cancel                                                key.Binding
+	Submit, NextField, Skip                                     key.Binding
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
@@ -49,7 +52,7 @@ func (k keyMap) FullHelp() [][]key.Binding { return [][]key.Binding{k.ShortHelp(
 var keys = keyMap{
 	Quit:   key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	Retest: key.NewBinding(key.WithKeys("t"), key.WithHelp("t", "retest")),
-	Launch: key.NewBinding(key.WithKeys("b"), key.WithHelp("b", "open browser")),
+	Launch: key.NewBinding(key.WithKeys("b"), key.WithHelp("b", "open browser/discord")),
 	Pick:   key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "open")),
 	Cancel: key.NewBinding(key.WithKeys("esc", "b"), key.WithHelp("esc", "cancel")),
 	Focus:  key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "focus")),
@@ -58,6 +61,10 @@ var keys = keyMap{
 	Follow: key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "follow")),
 	Up:     key.NewBinding(key.WithKeys("up", "k", "pgup")),
 	Down:   key.NewBinding(key.WithKeys("down", "j", "pgdown")),
+
+	Submit:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "log in")),
+	NextField: key.NewBinding(key.WithKeys("tab", "shift+tab", "up", "down"), key.WithHelp("tab", "next field")),
+	Skip:      key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "skip")),
 }
 
 type tickMsg time.Time
@@ -101,13 +108,20 @@ type model struct {
 	testing bool
 	exit    *hopsock.ExitInfo
 	testErr error
+	// A login prompt during the test inflates its latency, so test again.
+	promptedInTest bool
 
 	launches map[*launcher]*launchStatus
-	manual   *launcher // last browser opened from the picker
 
 	picking  bool
 	pickList []browserInfo
 	pickIdx  int
+
+	cred      *credAskMsg   // login form on screen
+	credQueue []*credAskMsg // more waiting
+	userIn    textinput.Model
+	passIn    textinput.Model
+	credFocus int // 0 user, 1 password
 
 	snap     hopsock.Snapshot
 	lastTick time.Time
@@ -130,7 +144,20 @@ func newModel(a *app) model {
 	h.Styles.ShortDesc = sMuted
 	h.Styles.ShortSeparator = sMuted
 
+	ui := textinput.New()
+	ui.Prompt = ""
+	ui.CharLimit = 255
+	ui.Width = 32
+	pi := textinput.New()
+	pi.Prompt = ""
+	pi.CharLimit = 255
+	pi.Width = 32
+	pi.EchoMode = textinput.EchoPassword
+	pi.EchoCharacter = '•'
+
 	m := model{
+		userIn:    ui,
+		passIn:    pi,
 		app:       a,
 		spin:      sp,
 		tbl:       t,
@@ -144,6 +171,7 @@ func newModel(a *app) model {
 	if a.launch != nil {
 		m.status(a.launch).state = "waiting"
 	}
+	m.testing = a.cfg.testURL != "" // Init can't mutate the model
 	return m
 }
 
@@ -186,6 +214,8 @@ func connectSSH(a *app) tea.Cmd {
 
 func (m *model) startTest() tea.Cmd {
 	m.testing = true
+	// A retest is the way to get a skipped login prompt back.
+	m.app.chain.ResetPrompts()
 	a := m.app
 	return func() tea.Msg {
 		info, err := a.preflight(context.Background())
@@ -217,12 +247,12 @@ func (m model) launchCmd(l *launcher) tea.Cmd {
 // openBrowser handles "b": relaunch the -browser one if it's closed,
 // otherwise show a picker of installed browsers.
 func (m *model) openBrowser() tea.Cmd {
-	if l := m.app.launch; l != nil && l.browser && !l.running() {
+	if l := m.app.launch; l != nil && l.kind != kindExec && !l.running() {
 		return m.launchCmd(l)
 	}
-	m.pickList = detectBrowsers()
+	m.pickList = detectApps()
 	if len(m.pickList) == 0 {
-		m.app.logs.Log(hopsock.LevelError, "no Chromium-based browser found; start with -browser /path/to/browser")
+		m.app.logs.Log(hopsock.LevelError, "no Chromium-based browser or Discord found; start with -browser /path/to/app")
 		return nil
 	}
 	m.picking, m.pickIdx = true, 0
@@ -232,17 +262,94 @@ func (m *model) openBrowser() tea.Cmd {
 func (m *model) pickBrowser() tea.Cmd {
 	m.picking = false
 	b := m.pickList[m.pickIdx]
-	if m.manual != nil && m.manual.running() {
-		m.app.logs.Log(hopsock.LevelWarn, m.manual.name+" is already open from here; close it first")
-		return nil
-	}
 	if m.testErr != nil {
 		m.app.logs.Log(hopsock.LevelWarn, "preflight failed, pages may not load")
 	}
-	l := browserLauncher(b.Path, m.app.cfg.profile, m.app.proxyAddr)
-	m.manual = l
+	// Reuse the launcher for this app so the status line shows one entry.
+	for _, l := range m.app.manual {
+		if l.argv[0] == b.Path {
+			if l.running() {
+				m.app.logs.Log(hopsock.LevelWarn, l.name+" is already open from here")
+				return nil
+			}
+			return m.launchCmd(l)
+		}
+	}
+	l := appLauncher(b.Path, m.app.cfg.profile, m.app.proxyAddr)
 	m.app.manual = append(m.app.manual, l)
 	return m.launchCmd(l)
+}
+
+// openCred shows the next queued login form, if any.
+func (m *model) openCred() tea.Cmd {
+	if m.cred != nil || len(m.credQueue) == 0 {
+		return nil
+	}
+	m.cred, m.credQueue = m.credQueue[0], m.credQueue[1:]
+	if m.testing {
+		m.promptedInTest = true
+	}
+	req := m.cred.req
+	m.userIn.SetValue(req.User)
+	m.userIn.CursorEnd()
+	m.passIn.SetValue("")
+	if req.NeedUser && req.User == "" {
+		return m.focusCred(0)
+	}
+	return m.focusCred(1)
+}
+
+func (m *model) focusCred(i int) tea.Cmd {
+	if !m.cred.req.NeedUser {
+		i = 1
+	}
+	m.credFocus = i
+	if i == 0 {
+		m.passIn.Blur()
+		return m.userIn.Focus()
+	}
+	m.userIn.Blur()
+	return m.passIn.Focus()
+}
+
+// answerCred replies to the open form and moves to the next one.
+func (m *model) answerCred(r credReply) tea.Cmd {
+	m.cred.reply <- r
+	if r.err != nil {
+		m.app.logs.Log(hopsock.LevelWarn, "skipped login for "+m.cred.req.Hop+"; press t to retest and be asked again")
+	}
+	m.cred = nil
+	m.userIn.Blur()
+	m.passIn.Blur()
+	return m.openCred()
+}
+
+func (m *model) credKey(msg tea.KeyMsg) tea.Cmd {
+	switch {
+	case msg.String() == "ctrl+c":
+		m.cred.reply <- credReply{err: hopsock.ErrPromptCanceled}
+		return tea.Quit
+	case key.Matches(msg, keys.Skip):
+		return m.answerCred(credReply{err: hopsock.ErrPromptCanceled})
+	case key.Matches(msg, keys.NextField):
+		return m.focusCred(1 - m.credFocus)
+	case key.Matches(msg, keys.Submit):
+		user := strings.TrimSpace(m.userIn.Value())
+		if m.cred.req.NeedUser && user == "" {
+			return m.focusCred(0)
+		}
+		if m.credFocus == 0 {
+			return m.focusCred(1)
+		}
+		return m.answerCred(credReply{user: user, pass: m.passIn.Value()})
+	}
+	var cmd tea.Cmd
+	if m.credFocus == 0 {
+		m.userIn, cmd = m.userIn.Update(msg)
+	} else {
+		m.passIn, cmd = m.passIn.Update(msg)
+	}
+	return cmd
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -252,7 +359,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.layout()
 
+	case credAskMsg:
+		m.credQueue = append(m.credQueue, &msg)
+		cmds = append(cmds, m.openCred())
+
 	case tea.KeyMsg:
+		if m.cred != nil {
+			cmds = append(cmds, m.credKey(msg))
+			break
+		}
 		if m.picking {
 			switch {
 			case key.Matches(msg, keys.Cancel):
@@ -339,6 +454,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case testDoneMsg:
 		m.testing = false
 		m.exit, m.testErr = msg.info, msg.err
+		if msg.err == nil && m.promptedInTest {
+			m.promptedInTest = false
+			cmds = append(cmds, m.startTest())
+		}
 		if msg.err != nil {
 			m.app.logs.Log(hopsock.LevelError, "preflight failed: "+msg.err.Error())
 		} else {
@@ -372,6 +491,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.spin, cmd = m.spin.Update(msg)
 		cmds = append(cmds, cmd)
+
+	default:
+		// cursor blink
+		if m.cred != nil {
+			var cmd tea.Cmd
+			if m.credFocus == 0 {
+				m.userIn, cmd = m.userIn.Update(msg)
+			} else {
+				m.passIn, cmd = m.passIn.Update(msg)
+			}
+			cmds = append(cmds, cmd)
+		}
 	}
 	return m, tea.Batch(cmds...)
 }

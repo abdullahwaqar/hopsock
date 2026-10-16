@@ -134,8 +134,10 @@ func (m model) View() string {
 	}
 	block := lipgloss.NewStyle().Height(m.tbl.Height() + 1).PaddingLeft(1)
 	switch {
+	case m.cred != nil:
+		out = append(out, " "+sWarn.Render("▸ LOGIN NEEDED"), block.Render(m.credView()))
 	case m.picking:
-		out = append(out, " "+sAcc.Render("▸ OPEN BROWSER THROUGH THE PROXY"), block.Render(m.pickerView()))
+		out = append(out, " "+sAcc.Render("▸ OPEN THROUGH THE PROXY"), block.Render(m.pickerView()))
 	case len(s.Active) == 0:
 		empty := sMuted.Render("no open connections, point an app at socks5://" + m.app.proxyAddr)
 		out = append(out, " "+tblTitle, block.Render(empty))
@@ -145,11 +147,18 @@ func (m model) View() string {
 	out = append(out, "", " "+logTitle)
 	out = append(out, lipgloss.NewStyle().PaddingLeft(1).Render(m.vp.View()))
 
-	if m.picking {
+	switch {
+	case m.cred != nil:
+		hk := []key.Binding{keys.Submit, keys.Skip}
+		if m.cred.req.NeedUser {
+			hk = []key.Binding{keys.Submit, keys.NextField, keys.Skip}
+		}
+		out = append(out, " "+m.help.ShortHelpView(hk))
+	case m.picking:
 		out = append(out, " "+m.help.ShortHelpView([]key.Binding{
 			key.NewBinding(key.WithKeys("up"), key.WithHelp("↑/↓", "choose")), keys.Pick, keys.Cancel,
 		}))
-	} else {
+	default:
 		hk := keys
 		hk.Retest.SetEnabled(m.app.cfg.testURL != "")
 		out = append(out, " "+m.help.View(hk))
@@ -160,6 +169,8 @@ func (m model) View() string {
 
 func (m model) statusPill() string {
 	switch {
+	case m.cred != nil:
+		return sWarn.Render("● login needed")
 	case m.testing:
 		return m.spin.View() + sAcc.Render(" testing chain")
 	case m.testErr != nil:
@@ -194,6 +205,8 @@ func (m model) sshLine() string {
 		st := s.State()
 		name := s.Config.User + "@" + s.Addr
 		switch {
+		case s.Prompting():
+			parts = append(parts, sWarn.Render("● ")+sText.Render(name)+sWarn.Render(" waiting for password"))
 		case st.Connected:
 			parts = append(parts, sOK.Render("● ")+sText.Render(name)+sMuted.Render(" up "+humanDur(time.Since(st.Since))))
 		case st.LastErr != nil:
@@ -207,7 +220,7 @@ func (m model) sshLine() string {
 
 func (m model) launchLine() string {
 	var parts []string
-	for _, l := range []*launcher{m.app.launch, m.manual} {
+	for _, l := range append([]*launcher{m.app.launch}, m.app.manual...) {
 		if l == nil {
 			continue
 		}
@@ -226,7 +239,7 @@ func (m model) launchLine() string {
 		}
 	}
 	if len(parts) == 0 {
-		return sMuted.Render("no browser open, press b to pick one")
+		return sMuted.Render("nothing open, press b to pick a browser or Discord")
 	}
 	return strings.Join(parts, sMuted.Render("  ·  "))
 }
@@ -246,10 +259,46 @@ func (m model) pickerView() string {
 		}
 		b.WriteString("  " + sMuted.Render(br.Path) + "\n")
 	}
-	prof := "your normal profile (must be closed first)"
-	if m.app.cfg.profile != "" {
-		prof = "profile " + pathx.ExpandHome(m.app.cfg.profile)
+	var note string
+	switch {
+	case m.pickList[m.pickIdx].Kind == kindDiscord:
+		note = "Discord must be fully quit first (including the tray icon); voice and video don't go through the proxy"
+	case m.app.cfg.profile != "":
+		note = "opens with profile " + pathx.ExpandHome(m.app.cfg.profile)
+	default:
+		note = "opens with your normal profile (must be closed first)"
 	}
-	b.WriteString("\n" + sMuted.Render("opens with "+prof))
+	b.WriteString("\n" + sMuted.Render(note))
+	return b.String()
+}
+
+func (m model) credView() string {
+	req := m.cred.req
+	var b strings.Builder
+	b.WriteString(sBold.Render(credHeadline(req)) + "\n")
+	if req.Retry {
+		b.WriteString(sErr.Render("that was rejected, try again") + "\n")
+	} else {
+		b.WriteString(sMuted.Render("not saved anywhere, kept in memory until hopsock exits") + "\n")
+	}
+	b.WriteString("\n")
+	field := func(label string, in string, focused bool) string {
+		mark := "  "
+		lbl := sMuted.Render(fmt.Sprintf("%-9s", label))
+		if focused {
+			mark = sAcc.Render("› ")
+			lbl = sBold.Render(fmt.Sprintf("%-9s", label))
+		}
+		return mark + lbl + " " + in + "\n"
+	}
+	if req.NeedUser {
+		b.WriteString(field("username", m.userIn.View(), m.credFocus == 0))
+	} else {
+		b.WriteString(field("username", sText.Render(req.User), false))
+	}
+	b.WriteString(field(passwordLabel(req), m.passIn.View(), m.credFocus == 1))
+	if n := len(m.credQueue); n > 0 {
+		b.WriteString("\n" + sMuted.Render(fmt.Sprintf("%d more waiting", n)))
+	}
 	return b.String()
 }

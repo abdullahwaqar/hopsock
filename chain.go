@@ -66,10 +66,24 @@ func (c *Chain) Close() error {
 	return errors.Join(errs...)
 }
 
+// ResetPrompts lets every hop ask for credentials again after a prompt was
+// declined.
+func (c *Chain) ResetPrompts() {
+	for _, h := range c.Hops {
+		if r, ok := h.Dialer.(interface{ ResetPrompt() }); ok {
+			r.ResetPrompt()
+		}
+	}
+}
+
 // ChainOptions tune NewChain. The zero value is fine.
 type ChainOptions struct {
 	Log          LogFunc
 	SSHKeepAlive time.Duration // see SSHDialer.KeepAlive
+
+	// Credentials, if set, is asked for usernames and passwords that a hop
+	// needs but the URL didn't give, and again when they're rejected.
+	Credentials CredentialsFunc
 }
 
 // NewChain builds a chain from hop URLs, outermost first:
@@ -161,15 +175,22 @@ func ParseHop(raw string, forward Dialer, opts *ChainOptions) (Hop, error) {
 
 	switch scheme {
 	case "socks5":
-		h.Dialer = &SOCKS5Dialer{Addr: addr, Username: username, Password: password, Forward: forward}
+		h.Dialer = &SOCKS5Dialer{Addr: addr, Username: username, Password: password, Forward: forward, Ask: opts.Credentials}
 	case "http":
-		h.Dialer = &HTTPDialer{Addr: addr, Username: username, Password: password, Forward: forward}
+		h.Dialer = &HTTPDialer{Addr: addr, Username: username, Password: password, Forward: forward, Ask: opts.Credentials}
 	case "ssh":
-		cfg, err := sshClientConfig(username, password, q, opts.Log)
+		ask := opts.Credentials != nil
+		cfg, err := sshClientConfig(username, password, q, opts.Log, ask)
 		if err != nil {
 			return Hop{}, err
 		}
-		h.Dialer = &SSHDialer{Addr: addr, Config: cfg, Forward: forward, KeepAlive: opts.SSHKeepAlive, Log: opts.Log}
+		d := &SSHDialer{Addr: addr, Config: cfg, Forward: forward, KeepAlive: opts.SSHKeepAlive, Log: opts.Log}
+		if ask {
+			// The dialer tries the password first and asks when it's
+			// missing or wrong.
+			d.Ask, d.Password = opts.Credentials, password
+		}
+		h.Dialer = d
 	}
 	return h, nil
 }
@@ -188,7 +209,9 @@ func readEnv(opt, name string) (string, error) {
 	return v, nil
 }
 
-func sshClientConfig(username, password string, q url.Values, log LogFunc) (*ssh.ClientConfig, error) {
+// sshClientConfig builds the client config. With prompt set, password auth
+// is left to SSHDialer.Ask so it can be asked for and retried.
+func sshClientConfig(username, password string, q url.Values, log LogFunc, prompt bool) (*ssh.ClientConfig, error) {
 	cfg := &ssh.ClientConfig{User: username, Timeout: DefaultHandshakeTimeout}
 	if t := q.Get("timeout"); t != "" {
 		d, err := time.ParseDuration(t)
@@ -233,7 +256,7 @@ func sshClientConfig(username, password string, q url.Values, log LogFunc) (*ssh
 			return slices.Concat(signers, ag.signers()), nil
 		}))
 	}
-	if password != "" {
+	if password != "" && !prompt {
 		cfg.Auth = append(cfg.Auth,
 			ssh.Password(password),
 			ssh.KeyboardInteractive(func(_, _ string, questions []string, _ []bool) ([]string, error) {
@@ -244,7 +267,7 @@ func sshClientConfig(username, password string, q url.Values, log LogFunc) (*ssh
 				return answers, nil
 			}))
 	}
-	if len(cfg.Auth) == 0 {
+	if len(cfg.Auth) == 0 && !prompt {
 		return nil, errors.New("ssh: no auth available (set a password, key=PATH, or run ssh-agent)")
 	}
 

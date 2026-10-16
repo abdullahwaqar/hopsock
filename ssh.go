@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -21,10 +22,31 @@ type SSHDialer struct {
 	KeepAlive time.Duration     // 0 means 30s, negative disables
 	Log       LogFunc
 
-	mu      sync.Mutex
-	client  *ssh.Client
-	since   time.Time
-	lastErr error
+	// Ask, if set, is offered as password and keyboard-interactive auth after
+	// Config.Auth. Password is tried first without asking. A password that
+	// works is reused when the session reconnects.
+	Ask      CredentialsFunc
+	Password string
+
+	mu         sync.Mutex
+	client     *ssh.Client
+	since      time.Time
+	lastErr    error
+	connecting *sshConnect
+
+	pwMu       sync.Mutex
+	pwInit     bool
+	pw         string
+	pwDeclined bool
+	prompting  bool
+}
+
+// sshConnect is one in-flight connection attempt shared by every caller
+// that needs the session while it's being set up.
+type sshConnect struct {
+	done   chan struct{}
+	client *ssh.Client
+	err    error
 }
 
 // SSHState describes the shared session.
@@ -39,6 +61,20 @@ func (d *SSHDialer) State() SSHState {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return SSHState{Connected: d.client != nil, Since: d.since, LastErr: d.lastErr}
+}
+
+// Prompting reports whether the dialer is waiting on Ask right now.
+func (d *SSHDialer) Prompting() bool {
+	d.pwMu.Lock()
+	defer d.pwMu.Unlock()
+	return d.prompting
+}
+
+// ResetPrompt lets Ask be called again after it was declined.
+func (d *SSHDialer) ResetPrompt() {
+	d.pwMu.Lock()
+	d.pwDeclined = false
+	d.pwMu.Unlock()
 }
 
 // Connect establishes the session now instead of on first use.
@@ -85,40 +121,56 @@ func (d *SSHDialer) DialContext(ctx context.Context, network, addr string) (net.
 }
 
 // session returns the live client, connecting if needed. fresh is true
-// when this call created it.
+// when the client was set up during this call.
+//
+// The handshake runs detached from ctx: it may wait on a password prompt,
+// and one caller giving up shouldn't abort it for everyone else.
 func (d *SSHDialer) session(ctx context.Context) (c *ssh.Client, fresh bool, err error) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.client != nil {
-		return d.client, false, nil
+		c = d.client
+		d.mu.Unlock()
+		return c, false, nil
 	}
 	if d.Config == nil {
+		d.mu.Unlock()
 		return nil, false, errors.New("ssh: no ClientConfig")
 	}
-	fwd := d.Forward
-	if fwd == nil {
-		fwd = Direct
+	call := d.connecting
+	if call == nil {
+		call = &sshConnect{done: make(chan struct{})}
+		d.connecting = call
+		go d.connect(call)
 	}
-	start := time.Now()
-	d.Log.logf(LevelInfo, "ssh %s: connecting as %s", d.Addr, d.Config.User)
-	raw, err := fwd.DialContext(ctx, "tcp", d.Addr)
-	if err != nil {
-		d.lastErr = err
-		return nil, false, fmt.Errorf("ssh %s: %w", d.Addr, err)
-	}
-	done := guardHandshake(ctx, raw)
-	sc, chans, reqs, err := ssh.NewClientConn(raw, d.Addr, d.Config)
-	done()
-	if err != nil {
-		raw.Close()
-		d.lastErr = err
-		return nil, false, fmt.Errorf("ssh %s: %w", d.Addr, err)
-	}
-	c = ssh.NewClient(sc, chans, reqs)
-	d.client, d.since, d.lastErr = c, time.Now(), nil
-	d.Log.logf(LevelInfo, "ssh %s: session up in %s (server %s)", d.Addr,
-		time.Since(start).Round(time.Millisecond), sc.ServerVersion())
+	d.mu.Unlock()
 
+	select {
+	case <-call.done:
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
+	if call.err != nil {
+		return nil, false, call.err
+	}
+	return call.client, true, nil
+}
+
+func (d *SSHDialer) connect(call *sshConnect) {
+	c, err := d.handshake()
+	d.mu.Lock()
+	d.connecting = nil
+	if err != nil {
+		d.lastErr = err
+		err = fmt.Errorf("ssh %s: %w", d.Addr, err)
+	} else {
+		d.client, d.since, d.lastErr = c, time.Now(), nil
+	}
+	call.client, call.err = c, err
+	d.mu.Unlock()
+	close(call.done)
+	if c == nil {
+		return
+	}
 	closed := make(chan struct{})
 	go func() {
 		err := c.Wait()
@@ -126,7 +178,115 @@ func (d *SSHDialer) session(ctx context.Context) (c *ssh.Client, fresh bool, err
 		d.drop(c, err)
 	}()
 	go d.keepalive(c, closed)
-	return c, true, nil
+}
+
+func (d *SSHDialer) handshake() (*ssh.Client, error) {
+	fwd := d.Forward
+	if fwd == nil {
+		fwd = Direct
+	}
+	start := time.Now()
+	d.Log.logf(LevelInfo, "ssh %s: connecting as %s", d.Addr, d.Config.User)
+	timeout := d.Config.Timeout
+	if timeout <= 0 {
+		timeout = DefaultHandshakeTimeout
+	}
+	dctx, cancel := context.WithTimeout(context.Background(), timeout)
+	raw, err := fwd.DialContext(dctx, "tcp", d.Addr)
+	cancel()
+	if err != nil {
+		return nil, err
+	}
+	_ = raw.SetDeadline(time.Now().Add(timeout))
+	cfg := d.Config
+	if d.Ask != nil {
+		cp := *d.Config
+		cp.Auth = append(slices.Clone(cp.Auth), d.promptAuth(raw, timeout)...)
+		cfg = &cp
+	}
+	sc, chans, reqs, err := ssh.NewClientConn(raw, d.Addr, cfg)
+	if err != nil {
+		raw.Close()
+		return nil, err
+	}
+	_ = raw.SetDeadline(time.Time{})
+	d.Log.logf(LevelInfo, "ssh %s: session up in %s (server %s)", d.Addr,
+		time.Since(start).Round(time.Millisecond), sc.ServerVersion())
+	return ssh.NewClient(sc, chans, reqs), nil
+}
+
+// promptAuth builds password and keyboard-interactive methods for one
+// handshake. The first answer is the remembered password, if any; after
+// that it asks. The handshake deadline is paused while a prompt is open.
+func (d *SSHDialer) promptAuth(raw net.Conn, timeout time.Duration) []ssh.AuthMethod {
+	tries := 0
+	hop := "ssh://" + d.Config.User + "@" + d.Addr
+	ask := func(retry bool, question string) (string, error) {
+		d.pwMu.Lock()
+		d.prompting = true
+		d.pwMu.Unlock()
+		_ = raw.SetDeadline(time.Time{})
+		_, p, err := d.Ask(context.Background(), CredRequest{
+			Hop: hop, Scheme: "ssh", Addr: d.Addr, User: d.Config.User,
+			Retry: retry, Prompt: question,
+		})
+		_ = raw.SetDeadline(time.Now().Add(timeout))
+		d.pwMu.Lock()
+		d.prompting = false
+		d.pwMu.Unlock()
+		return p, err
+	}
+	password := func(question string) (string, error) {
+		d.pwMu.Lock()
+		if !d.pwInit {
+			d.pw, d.pwInit = d.Password, true
+		}
+		cached, declined := d.pw, d.pwDeclined
+		tries++
+		if tries == 1 && cached != "" {
+			d.pwMu.Unlock()
+			return cached, nil
+		}
+		d.pwMu.Unlock()
+		if declined {
+			return "", ErrPromptCanceled
+		}
+
+		p, err := ask(tries > 1, question)
+
+		d.pwMu.Lock()
+		if err != nil {
+			d.pwDeclined = true
+		} else {
+			d.pw = p
+		}
+		d.pwMu.Unlock()
+		return p, err
+	}
+	return []ssh.AuthMethod{
+		ssh.RetryableAuthMethod(ssh.PasswordCallback(func() (string, error) { return password("") }), maxAuthPrompts),
+		ssh.RetryableAuthMethod(ssh.KeyboardInteractive(func(_, _ string, questions []string, echos []bool) ([]string, error) {
+			answers := make([]string, len(questions))
+			for i, q := range questions {
+				// A lone hidden question is the password; anything else
+				// (OTP codes, ...) is asked as is and not remembered.
+				if len(questions) == 1 && !echos[i] {
+					a, err := password(q)
+					if err != nil {
+						return nil, err
+					}
+					answers[i] = a
+					continue
+				}
+				a, err := ask(false, q)
+				if err != nil {
+					return nil, err
+				}
+				answers[i] = a
+			}
+			return answers, nil
+		}), maxAuthPrompts),
+	}
 }
 
 func (d *SSHDialer) drop(c *ssh.Client, cause error) {
