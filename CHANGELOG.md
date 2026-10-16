@@ -6,6 +6,24 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Discord desktop launch: `-discord`, or pick it with `b` in the dashboard.
+  Finds stable, PTB and Canary on Linux (including Flatpak and Snap), macOS
+  and Windows, and refuses to launch while Discord is already running.
+- Interactive logins: when a SOCKS5, HTTP or SSH hop needs a username or
+  password that wasn't given, or rejects the one it got, hopsock asks for it
+  (a form in the dashboard, a hidden prompt with `-plain`). `-prompt=false`
+  turns this off.
+- Library: `ChainOptions.Credentials`, `CredRequest`, `ErrAuthRequired`,
+  `ErrAuthFailed`, `ErrPromptCanceled`, `Chain.ResetPrompts`, and `Ask` on
+  each dialer.
+
+### Fixed
+
+- The dashboard no longer stalls while an SSH session is connecting.
+- The exit line shows "checking" during the first test instead of "pending".
+
 ## [1.0.0] - 2026-10-14
 
 ### Added

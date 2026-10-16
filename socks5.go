@@ -118,37 +118,52 @@ type SOCKS5Dialer struct {
 	Username string
 	Password string
 	Forward  Dialer // how to reach the proxy; nil means Direct
+
+	// Ask, if set, is called when the proxy wants credentials that weren't
+	// given or rejects the ones it got. What it returns is kept for later dials.
+	Ask CredentialsFunc
+
+	creds credStore
 }
+
+// ResetPrompt lets Ask be called again after it was declined.
+func (d *SOCKS5Dialer) ResetPrompt() { d.creds.reset() }
 
 func (d *SOCKS5Dialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	if err := checkTCP(network); err != nil {
 		return nil, err
 	}
+	base := CredRequest{Hop: "socks5://" + d.Addr, Scheme: "socks5", Addr: d.Addr}
+	return dialWithPrompt(ctx, &d.creds, d.Ask, base, d.Username, d.Password,
+		func(user, pass string) (net.Conn, bool, error) { return d.dial(ctx, addr, user, pass) })
+}
+
+func (d *SOCKS5Dialer) dial(ctx context.Context, addr, user, pass string) (net.Conn, bool, error) {
 	fwd := d.Forward
 	if fwd == nil {
 		fwd = Direct
 	}
 	conn, err := fwd.DialContext(ctx, "tcp", d.Addr)
 	if err != nil {
-		return nil, fmt.Errorf("socks5 %s: %w", d.Addr, err)
+		return nil, false, fmt.Errorf("socks5 %s: %w", d.Addr, err)
 	}
 	done := guardHandshake(ctx, conn)
-	err = d.handshake(conn, addr)
+	err = socks5Handshake(conn, addr, user, pass)
 	done()
 	if err != nil {
 		conn.Close()
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, false, ctx.Err()
 		}
-		return nil, fmt.Errorf("socks5 %s: %w", d.Addr, err)
+		return nil, true, fmt.Errorf("socks5 %s: %w", d.Addr, err)
 	}
-	return conn, nil
+	return conn, true, nil
 }
 
-func (d *SOCKS5Dialer) handshake(conn net.Conn, target string) error {
+func socks5Handshake(conn net.Conn, target, user, pass string) error {
 	// Greeting: offer no-auth, plus user/pass if we have credentials.
 	greet := []byte{socksVersion, 1, methodNoAuth}
-	if d.Username != "" {
+	if user != "" {
 		greet = []byte{socksVersion, 2, methodNoAuth, methodUserPass}
 	}
 	if _, err := conn.Write(greet); err != nil {
@@ -164,16 +179,16 @@ func (d *SOCKS5Dialer) handshake(conn net.Conn, target string) error {
 	switch sel[1] {
 	case methodNoAuth:
 	case methodUserPass:
-		if d.Username == "" {
-			return errors.New("proxy wants a username/password")
+		if user == "" {
+			return ErrAuthRequired
 		}
-		if len(d.Username) > 255 || len(d.Password) > 255 {
+		if len(user) > 255 || len(pass) > 255 {
 			return errors.New("username or password longer than 255 bytes")
 		}
-		req := []byte{0x01, byte(len(d.Username))}
-		req = append(req, d.Username...)
-		req = append(req, byte(len(d.Password)))
-		req = append(req, d.Password...)
+		req := []byte{0x01, byte(len(user))}
+		req = append(req, user...)
+		req = append(req, byte(len(pass)))
+		req = append(req, pass...)
 		if _, err := conn.Write(req); err != nil {
 			return err
 		}
@@ -182,9 +197,13 @@ func (d *SOCKS5Dialer) handshake(conn net.Conn, target string) error {
 			return fmt.Errorf("reading auth reply: %w", err)
 		}
 		if res[1] != 0x00 {
-			return errors.New("authentication failed (bad username or password)")
+			return ErrAuthFailed
 		}
 	case methodNoAcceptable:
+		if user == "" {
+			// We only offered no-auth, so the proxy wants credentials.
+			return ErrAuthRequired
+		}
 		return errors.New("proxy accepted none of our auth methods")
 	default:
 		return fmt.Errorf("proxy picked unsupported auth method %d", sel[1])

@@ -33,12 +33,14 @@ type config struct {
 	hops      hopList
 	testURL   string
 	browser   string
+	discord   bool
 	profile   string
 	execCmd   string
 	plain     bool
 	verbose   bool
 	keepAlive time.Duration
 	stay      bool
+	prompt    bool
 }
 
 const usageText = `hopsock: a local SOCKS5 proxy that tunnels through SOCKS5, HTTP and SSH hops
@@ -55,6 +57,9 @@ Examples:
   export PROXY_PASS='...'
   hopsock -F 'socks5://user@proxy.example.com:10001?passenv=PROXY_PASS' -browser vivaldi-stable
 
+  # No credentials in the URL: hopsock asks for them when the proxy wants them
+  hopsock -F socks5://proxy.example.com:10001 -discord
+
   # Chain: reach the SSH box through the SOCKS5 proxy, exit from the SSH box
   hopsock -F 'socks5://user@proxy:1080?passenv=PROXY_PASS' -F 'ssh://me@box?key=~/.ssh/id_ed25519'
 
@@ -63,6 +68,7 @@ Hop URLs (-F, repeatable, the first hop is dialed directly):
   http://[user[:pass]@]host[:8080]       HTTP CONNECT proxy
   ssh://[user[:pass]@]host[:22]          SSH direct-tcpip, like ssh -D
   All:  passenv=VAR   read the password from $VAR (no URL-encoding needed)
+        missing or rejected logins are asked for interactively (see -prompt)
   SSH:  key=PATH  keypassenv=VAR  agent=0  known_hosts=PATH
         hostkey=SHA256:...  insecure=1  timeout=20s
 
@@ -87,7 +93,14 @@ func run() int {
 	useTUI := !cfg.plain && isTerminal(os.Stdout) && isTerminal(os.Stdin)
 	logs := newLogBus(useTUI, cfg.verbose)
 
-	chain, err := hopsock.NewChain(cfg.hops, &hopsock.ChainOptions{Log: logs.Log, SSHKeepAlive: cfg.keepAlive})
+	opts := &hopsock.ChainOptions{Log: logs.Log, SSHKeepAlive: cfg.keepAlive}
+	var prompts *prompter
+	if cfg.prompt && isTerminal(os.Stdin) {
+		prompts = newPrompter(os.Stdin, os.Stderr)
+		defer prompts.close()
+		opts.Credentials = prompts.ask
+	}
+	chain, err := hopsock.NewChain(cfg.hops, opts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "hopsock:", err)
 		return 2
@@ -111,12 +124,22 @@ func run() int {
 	proxyAddr := dialableAddr(ln.Addr().String())
 
 	a := &app{cfg: cfg, proxyAddr: proxyAddr, chain: chain, stats: stats, logs: logs, started: time.Now()}
+	if (cfg.browser != "" || cfg.discord) && cfg.localUser != "" {
+		logs.Log(hopsock.LevelWarn, "Chromium browsers and Discord can't do SOCKS5 auth, so they will fail against a password-protected -L")
+	}
 	switch {
-	case cfg.browser != "":
-		if cfg.localUser != "" {
-			logs.Log(hopsock.LevelWarn, "Chromium browsers can't do SOCKS5 auth, so the browser will fail against a password-protected -L")
+	case cfg.discord:
+		found := detectDiscord()
+		if len(found) == 0 {
+			fmt.Fprintln(os.Stderr, "hopsock: no Discord install found; pass its path with -browser /path/to/Discord")
+			return 2
 		}
-		a.launch = browserLauncher(cfg.browser, cfg.profile, proxyAddr)
+		if cfg.profile != "" {
+			logs.Log(hopsock.LevelWarn, "-profile is ignored for Discord")
+		}
+		a.launch = discordLauncher(found[0].Path, proxyAddr)
+	case cfg.browser != "":
+		a.launch = appLauncher(cfg.browser, cfg.profile, proxyAddr)
 	case cfg.execCmd != "":
 		a.launch = execLauncher(cfg.execCmd, proxyAddr)
 	}
@@ -131,11 +154,20 @@ func run() int {
 	if useTUI {
 		p := tea.NewProgram(newModel(a), tea.WithAltScreen())
 		context.AfterFunc(ctx, p.Quit)
+		if prompts != nil {
+			prompts.attach(p.Send)
+		}
 		if _, err := p.Run(); err != nil {
 			fmt.Fprintln(os.Stderr, "hopsock: tui:", err)
 			code = 1
 		}
+		if prompts != nil {
+			prompts.close()
+		}
 	} else {
+		if prompts != nil {
+			context.AfterFunc(ctx, prompts.close)
+		}
 		code = runPlain(ctx, a)
 	}
 
@@ -165,9 +197,11 @@ func parseFlags(args []string) (config, error) {
 	fs.Var(&cfg.hops, "F", "upstream hop `url` (repeat for a chain, outermost first)")
 	fs.StringVar(&cfg.testURL, "test", "https://ipinfo.io/json", "`url` fetched through the chain at startup; \"off\" to skip")
 	fs.StringVar(&cfg.browser, "browser", "", "open a Chromium-based browser `binary` through the proxy once the test passes (vivaldi-stable, google-chrome, ...)")
+	fs.BoolVar(&cfg.discord, "discord", false, "open the Discord desktop app through the proxy once the test passes (it must be fully quit first)")
 	fs.StringVar(&cfg.profile, "profile", "", "pass --user-data-dir=`dir` to the browser for a separate instance; without it the browser must not already be running")
 	fs.StringVar(&cfg.execCmd, "exec", "", "run `command` (via sh -c) once the proxy is ready; {addr} becomes the proxy address")
-	fs.BoolVar(&cfg.stay, "stay", false, "keep running after the -browser/-exec process exits")
+	fs.BoolVar(&cfg.stay, "stay", false, "keep running after the -browser/-discord/-exec process exits")
+	fs.BoolVar(&cfg.prompt, "prompt", true, "ask for proxy usernames and passwords that are missing or rejected (needs a terminal); -prompt=false to just fail")
 	fs.BoolVar(&cfg.plain, "plain", false, "no TUI, log to stderr")
 	fs.BoolVar(&cfg.verbose, "v", false, "per-connection log lines")
 	fs.DurationVar(&cfg.keepAlive, "keepalive", 30*time.Second, "SSH keepalive `interval` (0 disables)")
@@ -188,8 +222,14 @@ func parseFlags(args []string) (config, error) {
 	if err := parseListen(listen, &cfg); err != nil {
 		return cfg, fmt.Errorf("-L: %w", err)
 	}
-	if cfg.browser != "" && cfg.execCmd != "" {
-		return cfg, errors.New("use either -browser or -exec, not both")
+	n := 0
+	for _, set := range []bool{cfg.browser != "", cfg.discord, cfg.execCmd != ""} {
+		if set {
+			n++
+		}
+	}
+	if n > 1 {
+		return cfg, errors.New("use only one of -browser, -discord and -exec")
 	}
 	if strings.EqualFold(cfg.testURL, "off") || strings.EqualFold(cfg.testURL, "none") {
 		cfg.testURL = ""
@@ -207,7 +247,7 @@ type app struct {
 	chain     *hopsock.Chain
 	stats     *hopsock.Stats
 	logs      *logBus
-	launch    *launcher   // from -browser or -exec
+	launch    *launcher   // from -browser, -discord or -exec
 	manual    []*launcher // opened from the TUI picker
 	started   time.Time
 }
