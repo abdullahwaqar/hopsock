@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- SSH config support: ssh hosts are looked up in `~/.ssh/config` (then
+  `/etc/ssh/ssh_config`) like ssh does, so `hopsock myalias` or
+  `-F ssh://myalias` works wherever `ssh myalias` does. Honors HostName,
+  User, Port, IdentityFile, IdentitiesOnly, IdentityAgent, ProxyJump (jump
+  hosts appear as hops), ProxyCommand, known hosts files,
+  StrictHostKeyChecking, HostKeyAlias and ConnectTimeout, with Host/Match
+  blocks, Include and % tokens. `-ssh-config FILE|none` and the
+  `ssh_config=` hop option pick another file or turn it off.
+- Hosts can be given as plain arguments after the flags.
+- Known hosts also checked in `~/.ssh/known_hosts2` and
+  `/etc/ssh/ssh_known_hosts`, like ssh.
+- Library: `ParseHops`, `ChainOptions.SSHConfig`, `CommandDialer`.
 - Discord desktop launch: `-discord`, or pick it with `b` in the dashboard.
   Finds stable, PTB and Canary on Linux (including Flatpak and Snap), macOS
   and Windows, and refuses to launch while Discord is already running.
