@@ -37,6 +37,9 @@ go install github.com/abdullahwaqar/hopsock/cmd/hopsock@latest
 # SSH dynamic forward, like ssh -D 1080 me@server
 hopsock -F ssh://me@server.example.com
 
+# A Host from ~/.ssh/config, like ssh -D 1080 myserver
+hopsock myserver
+
 # Authenticated upstream SOCKS5, open Vivaldi when the test passes
 hopsock -F 'socks5://user@proxy.example.com:10001?passenv=PROXY_PASS' -browser vivaldi-stable
 
@@ -69,6 +72,7 @@ the far end of the chain.
 | `-plain`     | false                    | No TUI, log to stderr. Automatic when output isn't a terminal                          |
 | `-v`         | false                    | Per-connection log lines                                                               |
 | `-keepalive` | `30s`                    | SSH keepalive interval, `0` disables                                                   |
+| `-ssh-config` |                          | OpenSSH config for ssh hosts. Default `~/.ssh/config` then `/etc/ssh/ssh_config`. `none` to ignore |
 | `-version`   |                          | Print version and exit                                                                 |
 
 ### Hop URLs
@@ -77,7 +81,11 @@ the far end of the chain.
 socks5://[user[:pass]@]host[:1080]     socks5h:// and socks:// also work
 http://[user[:pass]@]host[:8080]       HTTP CONNECT
 ssh://[user[:pass]@]host[:22]          SSH direct-tcpip channels
+myalias                                a Host from ~/.ssh/config, same as ssh://myalias
 ```
+
+Hosts can also be given after the flags (`hopsock myalias`); they're added
+after any `-F` hops.
 
 | Option               | Hops |                                                                          |
 | -------------------- | ---- | ------------------------------------------------------------------------ |
@@ -89,9 +97,32 @@ ssh://[user[:pass]@]host[:22]          SSH direct-tcpip channels
 | `hostkey=SHA256:...` | ssh  | Pin the server key instead of using known_hosts                          |
 | `insecure=1`         | ssh  | Skip host key checking. Testing only                                     |
 | `timeout=20s`        | ssh  | Handshake timeout                                                        |
+| `ssh_config=PATH`    | ssh  | Read this ssh config instead of `~/.ssh/config`, or `none`               |
 
 SSH tries key files, ssh-agent and your default keys (`id_ed25519`,
 `id_ecdsa`, `id_rsa`) first, then password and keyboard-interactive.
+
+### SSH config
+
+If `ssh myserver` works, `hopsock myserver` (or `-F ssh://myserver`) does
+too. Every ssh host, alias or not, is looked up in `~/.ssh/config` and then
+`/etc/ssh/ssh_config`, the way ssh does it: `Host` and `Match` blocks,
+`Include`, first value wins, and `%h`/`%p`/`%r`/`%u`/`%d` tokens. Anything
+in the hop URL (user, port, `key=`, ...) wins over the config.
+
+| Option                                          |                                                                       |
+| ----------------------------------------------- | --------------------------------------------------------------------- |
+| `HostName`, `User`, `Port`                      | Where to connect and as whom                                          |
+| `IdentityFile`, `IdentitiesOnly`                | Keys to try. An encrypted key is used through ssh-agent if it has it  |
+| `IdentityAgent`                                 | Agent socket, or `none`                                               |
+| `ProxyJump`                                     | Jump hosts become hops of their own and show up in the route          |
+| `ProxyCommand`                                  | Run as the transport. Only for the first hop                          |
+| `UserKnownHostsFile`, `GlobalKnownHostsFile`    | Where host keys are checked                                           |
+| `StrictHostKeyChecking no` / `accept-new`       | Unknown hosts are accepted (not saved). Changed keys are still refused |
+| `HostKeyAlias`, `ConnectTimeout`                | As in ssh                                                             |
+
+Other options are ignored. `Match exec`, `canonical`, `final`, `tagged` and
+`localnetwork` never match (hopsock says so in the log).
 
 ### Logins
 

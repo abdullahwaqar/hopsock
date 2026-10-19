@@ -73,18 +73,23 @@ func (s *testSSH) killSessions() {
 // sshServer is a minimal SSH server that only does direct-tcpip forwarding.
 func sshServer(t *testing.T, user, pass string) *testSSH {
 	t.Helper()
-	_, priv, _ := ed25519.GenerateKey(rand.Reader)
-	signer, err := ssh.NewSignerFromKey(priv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg := &ssh.ServerConfig{
+	return startSSH(t, &ssh.ServerConfig{
 		PasswordCallback: func(c ssh.ConnMetadata, p []byte) (*ssh.Permissions, error) {
 			if c.User() == user && string(p) == pass {
 				return nil, nil
 			}
 			return nil, fmt.Errorf("denied")
 		},
+	})
+}
+
+// startSSH serves cfg (given a fresh host key) on a local port.
+func startSSH(t *testing.T, cfg *ssh.ServerConfig) *testSSH {
+	t.Helper()
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatal(err)
 	}
 	cfg.AddHostKey(signer)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -316,7 +321,7 @@ func TestHostKeyPinWithPlus(t *testing.T) {
 			continue
 		}
 		u, _ := url.Parse("ssh://h?hostkey=" + fp) // unescaped, like a user would type it
-		cb, err := hostKeyCallback(u.Query(), nil)
+		cb, err := hostKeyCallback(u.Query(), nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

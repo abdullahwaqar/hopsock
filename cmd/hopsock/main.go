@@ -41,16 +41,21 @@ type config struct {
 	keepAlive time.Duration
 	stay      bool
 	prompt    bool
+	sshConfig string
 }
 
 const usageText = `hopsock: a local SOCKS5 proxy that tunnels through SOCKS5, HTTP and SSH hops
 
 Usage:
-  hopsock [flags]
+  hopsock [flags] [ssh-host ...]
 
 Examples:
   # SSH dynamic forward, like ssh -D 1080 me@server
   hopsock -F ssh://me@server.example.com
+
+  # A Host from ~/.ssh/config, like ssh -D 1080 myserver
+  # (HostName, User, Port, IdentityFile, ProxyJump, ... are read from it)
+  hopsock myserver
 
   # Authenticated upstream SOCKS5, then open Vivaldi through it
   # (or leave out -browser and press b in the TUI to pick a browser)
@@ -67,10 +72,12 @@ Hop URLs (-F, repeatable, the first hop is dialed directly):
   socks5://[user[:pass]@]host[:1080]     also socks5h:// and socks://
   http://[user[:pass]@]host[:8080]       HTTP CONNECT proxy
   ssh://[user[:pass]@]host[:22]          SSH direct-tcpip, like ssh -D
+  myalias                                a Host from ~/.ssh/config (same as ssh://myalias)
   All:  passenv=VAR   read the password from $VAR (no URL-encoding needed)
         missing or rejected logins are asked for interactively (see -prompt)
   SSH:  key=PATH  keypassenv=VAR  agent=0  known_hosts=PATH
-        hostkey=SHA256:...  insecure=1  timeout=20s
+        hostkey=SHA256:...  insecure=1  timeout=20s  ssh_config=PATH|none
+        ssh hosts are looked up in ~/.ssh/config like ssh does; URL values win
 
 Flags:
 `
@@ -93,7 +100,7 @@ func run() int {
 	useTUI := !cfg.plain && isTerminal(os.Stdout) && isTerminal(os.Stdin)
 	logs := newLogBus(useTUI, cfg.verbose)
 
-	opts := &hopsock.ChainOptions{Log: logs.Log, SSHKeepAlive: cfg.keepAlive}
+	opts := &hopsock.ChainOptions{Log: logs.Log, SSHKeepAlive: cfg.keepAlive, SSHConfig: cfg.sshConfig}
 	var prompts *prompter
 	if cfg.prompt && isTerminal(os.Stdin) {
 		prompts = newPrompter(os.Stdin, os.Stderr)
@@ -204,6 +211,7 @@ func parseFlags(args []string) (config, error) {
 	fs.BoolVar(&cfg.prompt, "prompt", true, "ask for proxy usernames and passwords that are missing or rejected (needs a terminal); -prompt=false to just fail")
 	fs.BoolVar(&cfg.plain, "plain", false, "no TUI, log to stderr")
 	fs.BoolVar(&cfg.verbose, "v", false, "per-connection log lines")
+	fs.StringVar(&cfg.sshConfig, "ssh-config", "", "OpenSSH client config `file` for ssh hosts (default ~/.ssh/config then /etc/ssh/ssh_config; \"none\" to ignore)")
 	fs.DurationVar(&cfg.keepAlive, "keepalive", 30*time.Second, "SSH keepalive `interval` (0 disables)")
 	fs.BoolVar(&showVersion, "version", false, "print version and exit")
 
@@ -216,8 +224,13 @@ func parseFlags(args []string) (config, error) {
 	if showVersion {
 		return cfg, errVersion
 	}
-	if fs.NArg() > 0 {
-		return cfg, fmt.Errorf("unexpected argument %q (hops go after -F)", fs.Arg(0))
+	// Positional arguments are hops too, so `hopsock myalias` works like
+	// `ssh myalias`. They go after any -F hops.
+	for _, a := range fs.Args() {
+		if strings.HasPrefix(a, "-") {
+			return cfg, fmt.Errorf("flag %s after a host: put flags first", a)
+		}
+		cfg.hops = append(cfg.hops, a)
 	}
 	if err := parseListen(listen, &cfg); err != nil {
 		return cfg, fmt.Errorf("-L: %w", err)

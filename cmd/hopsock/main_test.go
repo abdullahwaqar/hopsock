@@ -196,3 +196,16 @@ func TestPrompterRoutesToTUI(t *testing.T) {
 		t.Fatalf("got %q %q %v", u, pw, err)
 	}
 }
+
+func TestPositionalHosts(t *testing.T) {
+	cfg, err := parseFlags([]string{"-F", "socks5://p:1080", "lmw-live-chat-server"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.hops) != 2 || cfg.hops[1] != "lmw-live-chat-server" {
+		t.Fatalf("hops %q", cfg.hops)
+	}
+	if _, err := parseFlags([]string{"myhost", "-v"}); err == nil {
+		t.Fatal("a flag after the host should be an error, not a hop")
+	}
+}
