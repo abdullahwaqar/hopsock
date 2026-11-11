@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- SOCKS5 UDP ASSOCIATE: the local proxy relays UDP for its clients. With no
+  hops datagrams go out directly; through `socks5://` hops hopsock does UDP
+  ASSOCIATE with each upstream and nests the datagrams, so they leave from
+  the last proxy. HTTP and SSH hops carry TCP only, so UDP is refused with
+  "command not supported" when the chain has one, and the startup log names
+  the hop. `-udp=false` turns UDP off.
+- Library: `PacketConn`, `PacketDialer`, `DirectPacket`,
+  `ErrUDPNotSupported`, `SOCKS5Dialer.DialPacket`, `Chain.DialPacket`,
+  `Chain.UDPSupport` and `Server.DisableUDP`.
 - SSH config support: ssh hosts are looked up in `~/.ssh/config` (then
   `/etc/ssh/ssh_config`) like ssh does, so `hopsock myalias` or
   `-F ssh://myalias` works wherever `ssh myalias` does. Honors HostName,

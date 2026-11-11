@@ -42,6 +42,7 @@ type config struct {
 	stay      bool
 	prompt    bool
 	sshConfig string
+	udp       bool
 }
 
 const usageText = `hopsock: a local SOCKS5 proxy that tunnels through SOCKS5, HTTP and SSH hops
@@ -122,6 +123,18 @@ func run() int {
 		Dialer:   chain,
 		Log:      logs.Log,
 		Stats:    stats,
+
+		DisableUDP: !cfg.udp,
+	}
+	switch ok, blocker := chain.UDPSupport(); {
+	case !cfg.udp:
+		logs.Log(hopsock.LevelInfo, "udp: off (-udp=false)")
+	case !ok:
+		logs.Log(hopsock.LevelInfo, "udp: off, "+blocker+" carries tcp only (UDP needs socks5 hops all the way)")
+	case len(chain.Hops) == 0:
+		logs.Log(hopsock.LevelInfo, "udp: on, sent directly")
+	default:
+		logs.Log(hopsock.LevelInfo, "udp: on, if the socks5 upstream allows UDP ASSOCIATE")
 	}
 	ln, err := srv.Listen()
 	if err != nil {
@@ -211,6 +224,7 @@ func parseFlags(args []string) (config, error) {
 	fs.BoolVar(&cfg.prompt, "prompt", true, "ask for proxy usernames and passwords that are missing or rejected (needs a terminal); -prompt=false to just fail")
 	fs.BoolVar(&cfg.plain, "plain", false, "no TUI, log to stderr")
 	fs.BoolVar(&cfg.verbose, "v", false, "per-connection log lines")
+	fs.BoolVar(&cfg.udp, "udp", true, "serve SOCKS5 UDP ASSOCIATE when every hop is socks5; -udp=false to refuse it")
 	fs.StringVar(&cfg.sshConfig, "ssh-config", "", "OpenSSH client config `file` for ssh hosts (default ~/.ssh/config then /etc/ssh/ssh_config; \"none\" to ignore)")
 	fs.DurationVar(&cfg.keepAlive, "keepalive", 30*time.Second, "SSH keepalive `interval` (0 disables)")
 	fs.BoolVar(&showVersion, "version", false, "print version and exit")

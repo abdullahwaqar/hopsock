@@ -18,7 +18,8 @@ const (
 	methodUserPass     = 0x02
 	methodNoAcceptable = 0xFF
 
-	cmdConnect = 0x01
+	cmdConnect      = 0x01
+	cmdUDPAssociate = 0x03
 
 	atypIPv4   = 0x01
 	atypDomain = 0x03
@@ -161,6 +162,16 @@ func (d *SOCKS5Dialer) dial(ctx context.Context, addr, user, pass string) (net.C
 }
 
 func socks5Handshake(conn net.Conn, target, user, pass string) error {
+	if err := socks5Auth(conn, user, pass); err != nil {
+		return err
+	}
+	_, err := socks5Request(conn, cmdConnect, target)
+	return err
+}
+
+// socks5Auth runs the method negotiation and, if the proxy asks for it,
+// username/password auth (RFC 1929).
+func socks5Auth(conn net.Conn, user, pass string) error {
 	// Greeting: offer no-auth, plus user/pass if we have credentials.
 	greet := []byte{socksVersion, 1, methodNoAuth}
 	if user != "" {
@@ -208,28 +219,37 @@ func socks5Handshake(conn net.Conn, target, user, pass string) error {
 	default:
 		return fmt.Errorf("proxy picked unsupported auth method %d", sel[1])
 	}
+	return nil
+}
 
-	req := []byte{socksVersion, cmdConnect, 0x00}
+// socks5Request sends one request (CONNECT or UDP ASSOCIATE) and returns
+// the bound address from the reply.
+func socks5Request(conn net.Conn, cmd byte, target string) (string, error) {
+	req := []byte{socksVersion, cmd, 0x00}
 	req, err := appendAddr(req, target)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if _, err := conn.Write(req); err != nil {
-		return err
+		return "", err
 	}
 	var head [3]byte
 	if _, err := io.ReadFull(conn, head[:]); err != nil {
-		return fmt.Errorf("reading connect reply: %w", err)
+		return "", fmt.Errorf("reading reply: %w", err)
 	}
 	if head[1] != repSuccess {
 		msg := replyText[head[1]]
 		if msg == "" {
 			msg = fmt.Sprintf("reply code %d", head[1])
 		}
-		return fmt.Errorf("connect %s: %s", target, msg)
+		if cmd == cmdUDPAssociate {
+			return "", fmt.Errorf("udp associate: %s", msg)
+		}
+		return "", fmt.Errorf("connect %s: %s", target, msg)
 	}
-	if _, _, err := readAddr(conn); err != nil { // bound address, unused
-		return fmt.Errorf("reading bound addr: %w", err)
+	bound, _, err := readAddr(conn)
+	if err != nil {
+		return "", fmt.Errorf("reading bound addr: %w", err)
 	}
-	return nil
+	return bound, nil
 }

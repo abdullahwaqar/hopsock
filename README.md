@@ -71,6 +71,7 @@ the far end of the chain.
 | `-prompt`    | true                     | Ask for missing or rejected proxy logins. Needs a terminal. `-prompt=false` to fail    |
 | `-plain`     | false                    | No TUI, log to stderr. Automatic when output isn't a terminal                          |
 | `-v`         | false                    | Per-connection log lines                                                               |
+| `-udp`       | true                     | Serve SOCKS5 UDP ASSOCIATE when every hop is SOCKS5. `-udp=false` to refuse it         |
 | `-keepalive` | `30s`                    | SSH keepalive interval, `0` disables                                                   |
 | `-ssh-config` |                          | OpenSSH config for ssh hosts. Default `~/.ssh/config` then `/etc/ssh/ssh_config`. `none` to ignore |
 | `-version`   |                          | Print version and exit                                                                 |
@@ -159,6 +160,27 @@ ignore the proxy flags. hopsock checks for that and refuses to launch.
 A browser started with `-browser` ends the session when you close it, unless
 you pass `-stay`. Browsers opened with `b` don't end it.
 
+### UDP
+
+hopsock answers SOCKS5 UDP ASSOCIATE, so apps that send UDP through a SOCKS5
+proxy (games, DNS tools, VoIP clients, `proxychains`-style wrappers) work
+too. Datagrams leave from the far end of the chain, like TCP does.
+
+UDP needs SOCKS5 all the way:
+
+- No `-F`: datagrams are sent directly from this machine.
+- Only `socks5://` hops: hopsock does UDP ASSOCIATE with each one in turn
+  and nests the datagrams, so the exit sees them from the last proxy. The
+  upstream proxy has to allow UDP ASSOCIATE; many paid proxies do, most free
+  ones don't.
+- Any `http://` or `ssh://` hop: those carry TCP only, so UDP ASSOCIATE is
+  refused with "command not supported" and TCP keeps working. The log says
+  which hop is the blocker at startup.
+
+The relay listens on the same address as `-L` and only accepts datagrams
+from the client that set up the association, from the first port it sends
+from. Fragmented datagrams (FRAG != 0) are dropped, as most servers do.
+
 ### Discord
 
 `-discord` (or `b` in the dashboard) finds the Discord desktop app and starts
@@ -182,8 +204,10 @@ Things to know:
   Discord just focuses its window and ignores the proxy flags, so hopsock
   refuses to launch it. `-profile` doesn't apply.
 - Voice and video calls use UDP through Discord's own voice engine, which
-  can't go through a SOCKS5 proxy. They connect directly and Discord's voice
-  servers see your real IP.
+  ignores the proxy flags even though hopsock now relays SOCKS5 UDP. They
+  connect directly and Discord's voice servers see your real IP. Capturing
+  that traffic needs a TUN device or a per-app redirect, which hopsock
+  doesn't do yet.
 - If Discord updates itself and restarts, the new instance starts without the
   proxy flags. Quit it and open it again from hopsock.
 
@@ -229,7 +253,21 @@ again. Without a callback, auth failures wrap `hopsock.ErrAuthRequired` or
 `hopsock.ErrAuthFailed`.
 
 `SOCKS5Dialer`, `HTTPDialer` and `SSHDialer` each take a `Forward` dialer, so
-you can also stack them by hand. `SSHDialer` shares one session across
+you can also stack them by hand.
+
+For UDP, `Chain` and `SOCKS5Dialer` also implement `PacketDialer`:
+
+```go
+pc, err := chain.DialPacket(ctx) // errors.Is(err, hopsock.ErrUDPNotSupported) for http/ssh hops
+if err != nil {
+	return err
+}
+defer pc.Close()
+_, err = pc.WriteTo([]byte("ping"), "example.com:3478") // names resolve at the exit
+n, from, err := pc.ReadFrom(buf)
+```
+
+`chain.UDPSupport()` tells you up front whether every hop can carry UDP. `SSHDialer` shares one session across
 connections, sends keepalives and reconnects on demand. `Preflight` fetches a
 URL through any dialer and parses the exit IP.
 
@@ -237,7 +275,7 @@ The Go API may change before 1.0.
 
 ## Not supported
 
-UDP ASSOCIATE and BIND, remote (`-R`) forwarding, an HTTP proxy listener, and
+BIND, UDP over SSH hops, reassembling fragmented UDP datagrams, remote (`-R`) forwarding, an HTTP proxy listener, and
 TLS, WebSocket or QUIC transports.
 
 ## Development

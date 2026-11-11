@@ -17,8 +17,9 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// Server is a local SOCKS5 proxy (CONNECT only) that sends every
-// connection out through Dialer.
+// Server is a local SOCKS5 proxy that sends every connection out through
+// Dialer. It handles CONNECT and, when Dialer can carry UDP (see
+// PacketDialer), UDP ASSOCIATE.
 type Server struct {
 	Addr     string // listen address, e.g. "127.0.0.1:1080"
 	Username string // if set, clients must authenticate
@@ -28,6 +29,9 @@ type Server struct {
 	Stats    *Stats // created by Serve if nil
 
 	DialTimeout time.Duration // 0 means 30s
+
+	// DisableUDP refuses UDP ASSOCIATE even when Dialer could carry it.
+	DisableUDP bool
 }
 
 // ListenAndServe listens on s.Addr and serves until ctx is cancelled.
@@ -84,7 +88,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	client := conn.RemoteAddr().String()
 
 	_ = conn.SetDeadline(time.Now().Add(DefaultHandshakeTimeout))
-	target, err := s.negotiate(conn)
+	cmd, target, err := s.negotiate(conn)
 	if err != nil {
 		if !errors.Is(err, io.EOF) {
 			s.Log.logf(LevelDebug, "%s: handshake: %v", client, err)
@@ -92,6 +96,10 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
+	if cmd == cmdUDPAssociate {
+		s.handleUDP(ctx, conn)
+		return
+	}
 
 	timeout := s.DialTimeout
 	if timeout <= 0 {
@@ -130,18 +138,18 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 }
 
 // negotiate runs the SOCKS5 greeting, optional auth, and request, and
-// returns the requested target.
-func (s *Server) negotiate(conn net.Conn) (string, error) {
+// returns the command and its address.
+func (s *Server) negotiate(conn net.Conn) (byte, string, error) {
 	var hdr [2]byte
 	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
-		return "", err
+		return 0, "", err
 	}
 	if hdr[0] != socksVersion {
-		return "", fmt.Errorf("version %d is not SOCKS5", hdr[0])
+		return 0, "", fmt.Errorf("version %d is not SOCKS5", hdr[0])
 	}
 	methods := make([]byte, hdr[1])
 	if _, err := io.ReadFull(conn, methods); err != nil {
-		return "", err
+		return 0, "", err
 	}
 	want := byte(methodNoAuth)
 	if s.Username != "" {
@@ -155,33 +163,33 @@ func (s *Server) negotiate(conn net.Conn) (string, error) {
 	}
 	if !ok {
 		_, _ = conn.Write([]byte{socksVersion, methodNoAcceptable})
-		return "", errors.New("client offered no acceptable auth method")
+		return 0, "", errors.New("client offered no acceptable auth method")
 	}
 	if _, err := conn.Write([]byte{socksVersion, want}); err != nil {
-		return "", err
+		return 0, "", err
 	}
 	if want == methodUserPass {
 		if err := s.checkAuth(conn); err != nil {
-			return "", err
+			return 0, "", err
 		}
 	}
 
 	var req [3]byte
 	if _, err := io.ReadFull(conn, req[:]); err != nil {
-		return "", err
+		return 0, "", err
 	}
 	target, atyp, err := readAddr(conn)
 	if err != nil {
 		if atyp != 0 {
 			_, _ = conn.Write(reply(repAddrNotSupported))
 		}
-		return "", err
+		return 0, "", err
 	}
-	if req[1] != cmdConnect {
+	if req[1] != cmdConnect && req[1] != cmdUDPAssociate {
 		_, _ = conn.Write(reply(repCmdNotSupported))
-		return "", fmt.Errorf("command %d not supported (CONNECT only)", req[1])
+		return 0, "", fmt.Errorf("command %d not supported", req[1])
 	}
-	return target, nil
+	return req[1], target, nil
 }
 
 func (s *Server) checkAuth(conn net.Conn) error {
